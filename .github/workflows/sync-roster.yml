@@ -1,0 +1,54 @@
+# 명부 동기화 — 매일 예약 작업(00:00 UTC)이 끝난 뒤 피드를 받아 roster.json에 병합해 커밋한다.
+# ROSTER_FEED_URL: 저장소 Settings → Secrets and variables → Actions → Variables 에 등록 (Apps Script 웹앱 URL)
+name: sync-roster
+on:
+  schedule:
+    - cron: '30 0 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: fetch feed and merge
+        env:
+          FEED: ${{ vars.ROSTER_FEED_URL }}
+        run: |
+          set -e
+          test -n "$FEED" || { echo "ROSTER_FEED_URL not set"; exit 1; }
+          curl -sSL -m 90 "$FEED" -o /tmp/feed.json
+          python3 - <<'PY'
+          import json, datetime
+          feed = json.load(open('/tmp/feed.json'))
+          base = json.load(open('roster.json'))
+          people = {p['id']: p for p in base.get('people', [])}
+          snapshot = base.get('snapshot', '')
+          applied = 0
+          for f in feed.get('files', []):
+              try: d = json.loads(f['content'])
+              except Exception as e: print('skip', f['name'], e); continue
+              if isinstance(d.get('people'), list) and d['people']:
+                  if d.get('snapshot', '') >= snapshot:
+                      people = {p['id']: p for p in d['people']}; snapshot = d.get('snapshot', snapshot); applied += 1
+              elif isinstance(d.get('upserts'), list):
+                  for p in d['upserts']:
+                      if p.get('id'): people[p['id']] = p
+                  snapshot = max(snapshot, d.get('snapshot', '')); applied += 1
+          out = {'snapshot': snapshot or datetime.date.today().isoformat(), 'count': len(people),
+                 'people': sorted(people.values(), key=lambda p: p.get('name', ''))}
+          new = json.dumps(out, ensure_ascii=False, separators=(',', ':'))
+          old = open('roster.json', encoding='utf-8').read()
+          if new == old: print('no change'); open('/tmp/changed', 'w').write('0')
+          else:
+              open('roster.json', 'w', encoding='utf-8').write(new); open('/tmp/changed', 'w').write('1')
+              print('merged files:', applied, 'people:', len(people), 'snapshot:', snapshot)
+          PY
+          if [ "$(cat /tmp/changed)" = "0" ]; then exit 0; fi
+          git config user.name  "roster-bot"
+          git config user.email "roster-bot@users.noreply.github.com"
+          git add roster.json
+          git commit -m "roster: $(python3 -c "import json;d=json.load(open('roster.json'));print(d['snapshot'],d['count'],'people')")"
+          git push
+          curl -s "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@main/roster.json" || true
