@@ -1,0 +1,16 @@
+{
+  "name": "commander-library",
+  "version": "0.0.1",
+  "description": "명장 라이브러리 명부 데이터. roster.json 한 파일만 담아 jsDelivr(npm 경로)로 배포한다.",
+  "files": [
+    "roster.json"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MarcLJLee/commander_library.git"
+  },
+  "homepage": "https://marcljlee.github.io/commander_library/",
+  "publishConfig": {
+    "access": "public"
+  }
+}

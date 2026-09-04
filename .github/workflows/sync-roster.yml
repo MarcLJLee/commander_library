@@ -1,5 +1,8 @@
-# 명부 동기화 — 매일 예약 작업(00:00 UTC)이 끝난 뒤 피드를 받아 roster.json에 병합해 커밋한다.
-# ROSTER_FEED_URL: 저장소 Settings → Secrets and variables → Actions → Variables 에 등록 (Apps Script 웹앱 URL)
+# 명부 동기화: 매일 예약 작업(00:00 UTC)이 끝난 뒤 피드를 받아 roster.json에 병합해 커밋하고,
+# 변경이 있으면 npm 패키지(commander-library)로 발행한다.
+#   ROSTER_FEED_URL: Settings → Secrets and variables → Actions → Variables (Apps Script 웹앱 URL)
+#   NPM_TOKEN:       Settings → Secrets and variables → Actions → Secrets (npm Automation 토큰)
+# 아티펙트 쪽 CSP가 cdn.jsdelivr.net/npm/ 만 허용하므로 /gh/ 가 아니라 npm 경로로 발행한다.
 name: sync-roster
 on:
   schedule:
@@ -10,9 +13,12 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - name: fetch feed and merge
+        id: merge
         env:
           FEED: ${{ vars.ROSTER_FEED_URL }}
         run: |
@@ -45,6 +51,7 @@ jobs:
               open('roster.json', 'w', encoding='utf-8').write(new); open('/tmp/changed', 'w').write('1')
               print('merged files:', applied, 'people:', len(people), 'snapshot:', snapshot)
           PY
+          echo "changed=$(cat /tmp/changed)" >> "$GITHUB_OUTPUT"
           if [ "$(cat /tmp/changed)" = "0" ]; then exit 0; fi
           git config user.name  "roster-bot"
           git config user.email "roster-bot@users.noreply.github.com"
@@ -52,3 +59,24 @@ jobs:
           git commit -m "roster: $(python3 -c "import json;d=json.load(open('roster.json'));print(d['snapshot'],d['count'],'people')")"
           git push
           curl -s "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@main/roster.json" || true
+
+      - uses: actions/setup-node@v4
+        if: steps.merge.outputs.changed == '1' && env.NPM_TOKEN != ''
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: publish to npm
+        if: steps.merge.outputs.changed == '1' && env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -e
+          npm version patch -m "commander-library %s"
+          npm publish
+          git push --follow-tags
+          curl -s "https://purge.jsdelivr.net/npm/commander-library@latest/roster.json" || true
+
+      - name: npm publish skipped
+        if: steps.merge.outputs.changed == '1' && env.NPM_TOKEN == ''
+        run: echo "::warning::NPM_TOKEN 미설정, roster.json은 커밋됐지만 npm 발행은 건너뛰었습니다."
