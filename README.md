@@ -1,6 +1,6 @@
 # 명장 라이브러리 · Commander Library
 
-페이지: https://marcljlee.github.io/commander_library/  ·  Claude 페이지(산정): https://claude.ai/public/artifacts/51130626-2dc8-48b9-967f-f2ee576bcd0e
+페이지: https://marcljlee.github.io/commander_library/  ·  Claude 페이지(산정): https://claude.ai/public/artifacts/3db39228-cd99-4a3e-a1c5-3f0c60552f71
 
 동서양 4천 년의 장수들을 하나의 척도(1~1000, 평범한 성인 40, 인류 정점 100)로 매긴 명부입니다.
 눈금자 · 명부 · 대조 · 생애 곡선 · 동시대 연표를 담은 단일 HTML 페이지이며, 설치나 로그인 없이 열립니다.
