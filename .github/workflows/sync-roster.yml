@@ -1,13 +1,32 @@
 # 명부 동기화: 매일 예약 작업(00:00 UTC)이 끝난 뒤 피드를 받아 roster.json에 병합해 커밋하고,
-# 변경이 있으면 npm 패키지(commander-library)로 발행한다.
+# 발행이 필요하면 npm 패키지(commander-library)로 올린다.
 #   ROSTER_FEED_URL: Settings → Secrets and variables → Actions → Variables (Apps Script 웹앱 URL)
 #   NPM_TOKEN:       Settings → Secrets and variables → Actions → Secrets (npm Automation 토큰)
 # 아티펙트 쪽 CSP가 cdn.jsdelivr.net/npm/ 만 허용하므로 /gh/ 가 아니라 npm 경로로 발행한다.
+#
+# v2 (2026-09-08) 변경점
+#  1) 발행 조건을 "이번에 바뀜"에서 "package.json 버전 ≠ npm latest"로 확장 — 발행만 실패했던 회차를
+#     다음 실행이 스스로 복구한다. 예전에는 내용이 안 바뀌면 재시도 자체가 없어 영영 옛 버전에 머물렀다.
+#  2) 발행 직후 purge 1회 → CDN이 새 버전을 돌려줄 때까지 purge+확인 반복. 발행 직후의 단발 purge는
+#     레지스트리 별칭이 전파되기 전이라 옛 내용을 다시 캐시에 심는 역효과가 났다(09-07 0.0.2 사례:
+#     @0.0.2는 새 내용인데 @latest는 19시간 뒤에도 45명/2026-09-02를 반환).
+#  3) 피드가 JSON이 아니면 앞부분을 로그에 찍고 죽는다. Apps Script가 HTML 오류 페이지를 돌려줄 때
+#     원인을 바로 보기 위함.
+#  4) 스케줄을 하루 1회 → 6시간마다로. GitHub의 schedule 이벤트는 지연될 뿐 아니라 **통째로 건너뛰기도**
+#     한다(2026-09-08 00:30 UTC 회차가 실패가 아니라 아예 생성되지 않았다). 하루 1회면 한 번 걸러질 때
+#     명부가 하루를 통째로 잃는다. 위 2)의 자가복구와 "변화 없으면 skip" 덕에 헛도는 회차는 몇 초에
+#     끝나므로 자주 도는 비용이 거의 없다.
+#     분도 :00/:30을 피해 :17로 둔다 — 정각·30분은 전 세계 cron이 몰려 드롭 확률이 높은 구간이다.
 name: sync-roster
 on:
   schedule:
-    - cron: '30 0 * * *'
+    - cron: '17 */6 * * *'
   workflow_dispatch:
+    inputs:
+      force_publish:
+        description: '내용 변화가 없어도 npm 발행을 시도한다'
+        type: boolean
+        default: false
 permissions:
   contents: write
 jobs:
@@ -17,66 +36,119 @@ jobs:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+ 
       - name: fetch feed and merge
         id: merge
         env:
           FEED: ${{ vars.ROSTER_FEED_URL }}
         run: |
           set -e
-          test -n "$FEED" || { echo "ROSTER_FEED_URL not set"; exit 1; }
-          curl -sSL -m 90 "$FEED" -o /tmp/feed.json
+          test -n "$FEED" || { echo "::error::ROSTER_FEED_URL 변수가 비어 있습니다"; exit 1; }
+          curl -sSL -m 90 "$FEED" -o /tmp/feed.json || { echo "::error::피드 요청 실패"; exit 1; }
           python3 - <<'PY'
-          import json, datetime
-          feed = json.load(open('/tmp/feed.json'))
+          import json, datetime, sys
+          raw = open('/tmp/feed.json', encoding='utf-8', errors='replace').read()
+          try:
+              feed = json.loads(raw)
+          except Exception as e:
+              print('::error::피드가 JSON이 아닙니다:', e)
+              print('--- 응답 앞 300자 ---'); print(raw[:300])
+              sys.exit(1)
           base = json.load(open('roster.json'))
           people = {p['id']: p for p in base.get('people', [])}
           snapshot = base.get('snapshot', '')
           applied = 0
-          for f in feed.get('files', []):
+          files = feed.get('files', [])
+          print('피드 파일 수:', len(files))
+          for f in files:
               try: d = json.loads(f['content'])
-              except Exception as e: print('skip', f['name'], e); continue
+              except Exception as e: print('::warning::skip', f.get('name'), e); continue
               if isinstance(d.get('people'), list) and d['people']:
                   if d.get('snapshot', '') >= snapshot:
                       people = {p['id']: p for p in d['people']}; snapshot = d.get('snapshot', snapshot); applied += 1
+                      print('전체 스냅샷 적용:', f.get('name'), len(d['people']), '명')
               elif isinstance(d.get('upserts'), list):
                   for p in d['upserts']:
                       if p.get('id'): people[p['id']] = p
                   snapshot = max(snapshot, d.get('snapshot', '')); applied += 1
+                  print('delta 적용:', f.get('name'), len(d['upserts']), '건')
           out = {'snapshot': snapshot or datetime.date.today().isoformat(), 'count': len(people),
                  'people': sorted(people.values(), key=lambda p: p.get('name', ''))}
           new = json.dumps(out, ensure_ascii=False, separators=(',', ':'))
           old = open('roster.json', encoding='utf-8').read()
-          if new == old: print('no change'); open('/tmp/changed', 'w').write('0')
+          if new == old:
+              print('변화 없음 (people:', len(people), ')'); open('/tmp/changed', 'w').write('0')
           else:
               open('roster.json', 'w', encoding='utf-8').write(new); open('/tmp/changed', 'w').write('1')
-              print('merged files:', applied, 'people:', len(people), 'snapshot:', snapshot)
+              print('병합 파일:', applied, '/ people:', len(people), '/ snapshot:', snapshot)
           PY
           echo "changed=$(cat /tmp/changed)" >> "$GITHUB_OUTPUT"
-          if [ "$(cat /tmp/changed)" = "0" ]; then exit 0; fi
-          git config user.name  "roster-bot"
-          git config user.email "roster-bot@users.noreply.github.com"
-          git add roster.json
-          git commit -m "roster: $(python3 -c "import json;d=json.load(open('roster.json'));print(d['snapshot'],d['count'],'people')")"
-          git push
-          curl -s "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@main/roster.json" || true
-
+          if [ "$(cat /tmp/changed)" = "1" ]; then
+            git config user.name  "roster-bot"
+            git config user.email "roster-bot@users.noreply.github.com"
+            git add roster.json
+            git commit -m "roster: $(python3 -c "import json;d=json.load(open('roster.json'));print(d['snapshot'],d['count'],'people')")"
+            git push
+          fi
+ 
       - uses: actions/setup-node@v4
-        if: steps.merge.outputs.changed == '1' && env.NPM_TOKEN != ''
+        if: env.NPM_TOKEN != ''
         with:
           node-version: 20
           registry-url: 'https://registry.npmjs.org'
-
+ 
+      # 발행이 필요한지 스스로 판단한다.
+      #  - 이번에 roster.json이 바뀌었다 → patch 범프 후 발행
+      #  - 안 바뀌었지만 package.json 버전이 npm latest와 다르다 → 범프 없이 현재 버전 발행 (지난 실패 복구)
+      - name: decide publish
+        id: decide
+        if: env.NPM_TOKEN != ''
+        run: |
+          set -e
+          LOCAL=$(node -p "require('./package.json').version")
+          REMOTE=$(npm view commander-library version 2>/dev/null || echo "none")
+          echo "local=$LOCAL remote=$REMOTE changed=${{ steps.merge.outputs.changed }}"
+          if [ "${{ steps.merge.outputs.changed }}" = "1" ]; then
+            echo "mode=bump" >> "$GITHUB_OUTPUT"
+          elif [ "$LOCAL" != "$REMOTE" ] || [ "${{ inputs.force_publish }}" = "true" ]; then
+            echo "mode=republish" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=skip" >> "$GITHUB_OUTPUT"
+          fi
+          echo "remote=$REMOTE" >> "$GITHUB_OUTPUT"
+ 
       - name: publish to npm
-        if: steps.merge.outputs.changed == '1' && env.NPM_TOKEN != ''
+        if: env.NPM_TOKEN != '' && steps.decide.outputs.mode != 'skip'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -e
-          npm version patch -m "commander-library %s"
+          git config user.name  "roster-bot"
+          git config user.email "roster-bot@users.noreply.github.com"
+          if [ "${{ steps.decide.outputs.mode }}" = "bump" ]; then
+            npm version patch -m "commander-library %s"
+          fi
           npm publish
-          git push --follow-tags
-          curl -s "https://purge.jsdelivr.net/npm/commander-library@latest/roster.json" || true
-
+          git push --follow-tags || true
+          echo "published=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+ 
+      # jsDelivr의 @latest 별칭은 발행 직후 바로 갱신되지 않는다.
+      # 한 번 치고 마는 purge는 옛 내용을 다시 캐시에 심을 수 있으므로, 새 버전이 보일 때까지 반복한다.
+      - name: purge jsDelivr until @latest matches
+        if: env.NPM_TOKEN != '' && steps.decide.outputs.mode != 'skip'
+        run: |
+          WANT=$(node -p "require('./package.json').version")
+          echo "기대 버전: $WANT"
+          for i in 1 2 3 4 5 6; do
+            curl -s "https://purge.jsdelivr.net/npm/commander-library@latest/roster.json" >/dev/null || true
+            curl -s "https://purge.jsdelivr.net/npm/commander-library@latest/package.json" >/dev/null || true
+            sleep 20
+            GOT=$(curl -s "https://cdn.jsdelivr.net/npm/commander-library@latest/package.json" | node -p "try{JSON.parse(require('fs').readFileSync(0,'utf8')).version}catch(e){'?'}" || echo '?')
+            echo "  시도 $i: @latest = $GOT"
+            if [ "$GOT" = "$WANT" ]; then echo "✅ @latest 갱신 확인"; exit 0; fi
+          done
+          echo "::warning::@latest가 아직 $WANT 를 가리키지 않습니다. 잠시 후 https://purge.jsdelivr.net/npm/commander-library@latest/roster.json 를 직접 열어 확인하세요."
+ 
       - name: npm publish skipped
-        if: steps.merge.outputs.changed == '1' && env.NPM_TOKEN == ''
-        run: echo "::warning::NPM_TOKEN 미설정, roster.json은 커밋됐지만 npm 발행은 건너뛰었습니다."
+        if: env.NPM_TOKEN == ''
+        run: echo "::warning::NPM_TOKEN 미설정 — roster.json은 커밋됐지만 npm 발행은 건너뛰었습니다."
